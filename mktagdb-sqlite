@@ -1,0 +1,219 @@
+#!/usr/bin/python3
+#
+# Generate a sqlite DB of fake tagged file objects
+# THIS IS ONLY AN EXPERIMENT
+#
+
+import os
+import dnf
+import argparse
+import tempfile
+import sqlite3
+from binascii import hexlify
+from hashlib import sha256
+
+def setup_argparse():
+    parser = argparse.ArgumentParser(description="Generate repo stats")
+
+    parser.add_argument("-r", "--release", help="release information", default=None, metavar="STRING")
+    parser.add_argument("-s", "--source", help="source repository (may be listed multiple times)",
+                        metavar="REPOSITORY", action="append", default=[])
+    parser.add_argument("--tempdir", help="Directory to store temporary DNF files")
+    return parser
+
+
+def get_dbo(tempdir, repositories):
+    """ Create a dnf Base object and setup the repositories and installroot
+
+        :param list repositories: List of repositories to use for the installation
+        :param string releasever: Release version to pass to dnf
+
+    """
+    def sanitize_repo(repo):
+        """Convert bare paths to file:/// URIs, and silently reject protocols unhandled by dnf"""
+        if repo.startswith("/"):
+            return "file://{0}".format(repo)
+        elif any(repo.startswith(p) for p in ('http://', 'https://', 'ftp://', 'file://')):
+            return repo
+        else:
+            return None
+
+    # sanitize the repositories
+    repositories = list(sanitize_repo(r) for r in repositories)
+
+    # remove invalid repositories
+    repositories = list(r for r in repositories if r)
+
+    cachedir = os.path.join(tempdir, "dnf.cache")
+    if not os.path.isdir(cachedir):
+        os.mkdir(cachedir)
+
+    logdir = os.path.join(tempdir, "dnf.logs")
+    if not os.path.isdir(logdir):
+        os.mkdir(logdir)
+
+    dnfbase = dnf.Base()
+    conf = dnfbase.conf
+
+    # setup dirs.
+    conf.logdir = logdir
+    conf.cachedir = cachedir
+
+    # Turn off logging to the console
+    conf.debuglevel = 10
+    conf.errorlevel = 0
+
+    # add the repositories
+    for i, r in enumerate(repositories):
+        if "SRPM" in r or "srpm" in r:
+            print("Skipping source repo: %s" % r)
+            continue
+        repo_name = "stats-repo-%d" % i
+        repo = dnf.repo.Repo(repo_name, cachedir)
+        repo.baseurl = [r]
+        repo.skip_if_unavailable = False
+        repo.enable()
+        dnfbase.repos.add(repo)
+        print("Added '%s': %s" % (repo_name, r))
+        print("Fetching metadata...")
+        try:
+            repo.load()
+        except dnf.exceptions.RepoError as e:
+            print("Error fetching metadata for %s: %s" % (repo_name, e))
+            return None
+
+    if not repositories:
+        print("Using local system repos")
+        dnfbase.read_all_repos()
+
+    dnfbase.fill_sack(load_system_repo=not repositories)
+    dnfbase.read_comps()
+
+    return dnfbase
+
+
+class DbSchema(object):
+    """
+    Database schema creation and modification
+    """
+
+    # Schema revisions, rev[0], etc. is a list of SQL operations to run to
+    # bring the database up to date.
+    sql = ["""  create table tags(id INTEGER PRIMARY KEY, tag, value, type, item);
+                create index tags_index on tags(tag, value, item);
+
+                create table schema(version);
+                insert into schema(version) values(1);
+            """,
+          ]
+
+    def __init__(self, database):
+        self.database = database
+
+    def upgrade(self):
+        """
+        Upgrade the database to the current schema version
+        """
+        # Get the current schema version number
+        conn = sqlite3.connect(self.database)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        try:
+            cur.execute("select version from schema")
+            version = cur.fetchone()['version']
+        except:
+            version = 0
+
+        if len(self.sql) > version:
+            for update in self.sql[version:]:
+                cur.executescript(update)
+        cur.close()
+        conn.close()
+
+
+def guess_tags_from_path(path):
+    """Return a list of (tag, value) tuples"""
+    COMPONENTS = {"/etc/"   : "etc",
+                  "/lib/"   : "lib",
+                  "/lib64/" : "lib64",
+                  "/man"    : "manpage",
+                  "/share/" : "share",
+                  "/doc/"   : "docs",
+                  "/bin/"   : "binary",
+                  "/sbin"   : "binary"}
+
+    # Guess at FILETYPE tags
+    tags = []
+    for c in COMPONENTS:
+        if c in path:
+            tags.append(("FILETYPE", COMPONENTS[c]))
+
+    return tags
+
+
+def create_sqlite_db(base, db):
+    """Create the sqlite db from the repo data"""
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    for pkg in sorted(base.sack.query().available()):
+        print("%s-%s.%s %s" % (pkg.name, pkg.evr, pkg.arch, len(pkg.files)))
+
+        # Simple tag attributes
+        PKG_TAGS = ("arch", "buildtime", "description", "downloadsize", "evr", "installsize",
+                    "installtime", "license", "name", "packager", "size", "sourcerpm", "summary",
+                    "url")
+        # Insert tags on the package itself, using it's checksum as the item.
+        pkg_chksum = hexlify(pkg.chksum[1]).decode()
+        sql = "insert into tags(tag, value, type, item) values (?, ?, ?, ?)"
+        for tag in PKG_TAGS:
+            try:
+                cur.execute(sql, (tag, getattr(pkg, tag, ""), "package", pkg_chksum))
+            except sqlite3.Error as e:
+                print("Error inserting pkg tags: %s" % e)
+
+        # Other interesting things:
+        #  .conflicts
+        #  .enhances
+        #  .obsoletes
+        #  .provides
+        #  .recommends
+        #  .requires
+        #  .suggests
+        #  .supplements
+
+        # Insert tags for all the files from this package
+        for f in pkg.files:
+            file_chksum = sha256(f.encode()).hexdigest()
+            try:
+                cur.execute(sql, ("PACKAGE", pkg_chksum, "file", file_chksum))
+            except sqlite3.Error as e:
+                print("Error inserting file tags: %s" % e)
+
+            tags = guess_tags_from_path(f)
+            for tag, value in tags:
+                try:
+                    cur.execute(sql, (tag, value, "file", file_chksum))
+                except sqlite3.Error as e:
+                    print("Error inserting file tags: %s" % e)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+if __name__ == "__main__":
+    parser = setup_argparse()
+    opts = parser.parse_args()
+
+    tempdir = opts.tempdir or tempfile.mkdtemp(prefix="tagdb.")
+    print("Using tempdir: %s" % tempdir)
+    dbo = get_dbo(tempdir, opts.source)
+
+    DbSchema("./bdcs-tags.db").upgrade()
+
+    create_sqlite_db(dbo, "./bdcs-tags.db")
+
+    print("Remember to cleanup %s, or reuse it by passing --tempdir=%s" % (tempdir, tempdir))
+

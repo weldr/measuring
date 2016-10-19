@@ -192,7 +192,9 @@ def create_sqlite_db(base, db):
             except sqlite3.Error as e:
                 print("Error inserting file tags: %s" % e)
 
-            tags = guess_tags_from_path(f)
+            tags = [("PATH", f)] + guess_tags_from_path(f)
+            if "-devel" in pkg.name:
+                tags.append(("FILETYPE", "devel"))
             for tag, value in tags:
                 try:
                     cur.execute(sql, (tag, value, "file", file_chksum))

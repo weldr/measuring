@@ -1,0 +1,15 @@
+#!/usr/bin/python3
+import re
+
+# Parse tagtbl.C into a table of tag names mapped to rpm tag types
+
+print("TAG_TYPES = {")
+
+for line in open("tagtbl.C").readlines():
+    fields = re.split(r"[{},\W]+", line)
+    if len(fields) != 8:
+        continue
+
+    print('    "%s": "%s",' % (fields[3], fields[4]))
+print("}")
+

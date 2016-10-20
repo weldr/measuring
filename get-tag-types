@@ -10,6 +10,6 @@ for line in open("tagtbl.C").readlines():
     if len(fields) != 8:
         continue
 
-    print('    "%s": "%s",' % (fields[3], fields[4]))
+    print('    "%s": "%s",' % (fields[1], fields[4]))
 print("}")
 
